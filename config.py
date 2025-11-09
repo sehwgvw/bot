@@ -1,7 +1,7 @@
-BOT_TOKEN = '8213582854:AAE3ZJF0NM8MqJ7bc9Ir6odsAs0J0_MQ_-k' # токен бота
-BOT_LOGIN = "jhgfasdasfdjhgfdghBot" # без '@'
+BOT_TOKEN = '*******:*************************' # токен бота
+BOT_LOGIN = "" # без '@'
 DATABASE = "./data/database.db" # директория и название базы данных
-ADMINs_ID = [7544069555]
+ADMINs_ID = []
 
 
 FAQ_TEXT = """
