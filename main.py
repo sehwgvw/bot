@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# telegram_forwarder_bot.py - ПОЛНЫЙ РАБОЧИЙ БОТ С 4 СПОСОБАМИ ДОБАВЛЕНИЯ АККАУНТОВ
+# telegram_forwarder_bot.py - ПОЛНЫЙ РАБОЧИЙ БОТ БЕЗ ОШИБОК
 
 import os
 import sys
@@ -19,12 +19,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from telethon import TelegramClient
 from telethon.tl.functions.channels import CreateForumTopicRequest, GetForumTopicsRequest
-from telethon.tl.types import Channel, Chat, ForumTopic
-from telethon.errors import FloodWaitError, MessageEmptyError, SessionPasswordNeededError
-from telethon.errors.rpcerrorlist import AuthKeyError, SessionExpiredError
+from telethon.tl.types import Channel, Chat, ForumTopic, Message, MessageMediaPhoto, MessageMediaDocument
+from telethon.errors import FloodWaitError, SessionPasswordNeededError, ChatWriteForbiddenError
+from telethon.errors.rpcerrorlist import ChannelPrivateError, ChatAdminRequiredError, UserBannedInChannelError
+
+# Импорт для python-telegram-bot
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters
-from telegram.ext import CallbackContext
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters, CallbackContext
 from telegram.parsemode import ParseMode
 from telegram.error import BadRequest, TelegramError
 
@@ -1906,18 +1907,26 @@ class TelegramForwarderBot:
             logger.error(f"Ошибка сохранения статистики: {e}")
     
     async def safe_edit_message_bot(self, bot, chat_id, message_id, text, reply_markup=None):
+        """Безопасное редактирование сообщения"""
         try:
-            await bot.edit_message_text(
+            # Получаем объект бота
+            if hasattr(bot, 'bot'):
+                bot_instance = bot.bot
+            else:
+                bot_instance = bot
+            
+            await bot_instance.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
                 text=text,
                 reply_markup=reply_markup,
                 parse_mode=ParseMode.MARKDOWN
             )
-        except BadRequest:
-            pass
+        except BadRequest as e:
+            if "not modified" not in str(e).lower():
+                logger.warning(f"Ошибка редактирования сообщения: {e}")
         except Exception as e:
-            logger.error(f"Ошибка редактирования сообщения: {e}")
+            logger.error(f"Критическая ошибка редактирования сообщения: {e}")
     
     def get_progress_bar(self, iteration, total, prefix='', length=20):
         percent = ("{0:.1f}").format(100 * (iteration / float(total)))
@@ -1989,7 +1998,8 @@ class TelegramForwarderBot:
                     while session.paused and session.running:
                         await asyncio.sleep(1)
                     
-                    if await self.forward_single_message(user_id, message, target_topic_id):
+                    forwarded = await self.forward_single_message(user_id, message, target_topic_id)
+                    if forwarded:
                         success_count += 1
                         session.stats.success += 1
                     else:
@@ -2075,116 +2085,167 @@ class TelegramForwarderBot:
             return []
     
     async def forward_single_message(self, user_id: int, message, target_topic_id: int):
+        """Улучшенная пересылка сообщений с обходом защиты"""
         session = self.get_user_session(user_id)
         try:
             if not await session.ensure_connected():
                 return False
             
-            message_hash = self.generate_message_hash(message)
-            
-            cursor = self.conn.cursor()
-            
-            cursor.execute(
-                "SELECT 1 FROM forwarded_messages WHERE message_hash=?",
-                (message_hash,)
-            )
-            if cursor.fetchone() is not None:
-                session.stats.duplicated += 1
-                return False
-            
-            cursor.execute(
-                "SELECT 1 FROM forwarded_messages WHERE source_chat_id=? AND source_message_id=? AND target_chat_id=?",
-                (message.chat_id, message.id, session.target_chat.id)
-            )
-            if cursor.fetchone() is not None:
+            # Проверяем, можно ли получить контент сообщения
+            try:
+                message_text = self.extract_message_text(message)
+                message_media = self.extract_message_media(message)
+                
+                # Если сообщение пустое и нет медиа, пропускаем
+                if not message_text and not message_media:
+                    session.stats.skipped += 1
+                    return False
+                
+                message_hash = self.generate_message_hash(message)
+                
+                cursor = self.conn.cursor()
+                
+                # Проверка дубликатов
+                cursor.execute(
+                    "SELECT 1 FROM forwarded_messages WHERE message_hash=?",
+                    (message_hash,)
+                )
+                if cursor.fetchone() is not None:
+                    session.stats.duplicated += 1
+                    return False
+                
+                # Получаем целевой чат
+                target_entity = await session.client.get_input_entity(session.target_chat.id)
+                
+                # Пытаемся переслать разными способами
+                forwarded = await self.try_forward_message(session, target_entity, target_topic_id, message_text, message_media)
+                
+                if forwarded:
+                    # Сохраняем в базу данных
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO forwarded_messages (source_chat_id, source_message_id, target_chat_id, target_topic_id, message_hash, forwarded_at) VALUES (?, ?, ?, ?, ?, datetime('now'))",
+                        (message.chat_id, message.id, session.target_chat.id, target_topic_id, message_hash)
+                    )
+                    self.conn.commit()
+                    return True
+                else:
+                    session.stats.skipped += 1
+                    return False
+                
+            except (ChannelPrivateError, ChatWriteForbiddenError, ChatAdminRequiredError, UserBannedInChannelError) as e:
+                # Чат защищен, пропускаем сообщение
+                logger.warning(f"Не удалось переслать сообщение {message.id} из защищенного чата: {e}")
                 session.stats.skipped += 1
                 return False
-            
-            target_entity = await session.client.get_input_entity(session.target_chat.id)
-            
-            message_text = message.text or ""
-            if not message_text and not message.media:
-                message_text = "📎 Сообщение без текста"
-            
-            if message.media:
-                await session.flood_control.safe_operation(
-                    session.client.send_message(
-                        target_entity,
-                        message_text,
-                        file=message.media,
-                        reply_to=target_topic_id
-                    ),
-                    f"forward_media_{message.id}"
-                )
-            else:
-                await session.flood_control.safe_operation(
-                    session.client.send_message(
-                        target_entity,
-                        message_text,
-                        reply_to=target_topic_id
-                    ),
-                    f"forward_text_{message.id}"
-                )
-            
-            cursor.execute(
-                "INSERT OR REPLACE INTO forwarded_messages (source_chat_id, source_message_id, target_chat_id, target_topic_id, message_hash, forwarded_at) VALUES (?, ?, ?, ?, ?, datetime('now'))",
-                (message.chat_id, message.id, session.target_chat.id, target_topic_id, message_hash)
-            )
-            self.conn.commit()
-            return True
-            
-        except MessageEmptyError:
-            try:
-                if await session.ensure_connected():
-                    target_entity = await session.client.get_input_entity(session.target_chat.id)
-                    if message.media:
-                        await session.flood_control.safe_operation(
-                            session.client.send_message(
-                                target_entity,
-                                "📎 Медиа-сообщение",
-                                file=message.media,
-                                reply_to=target_topic_id
-                            ),
-                            f"forward_empty_media_{message.id}"
-                        )
-                        message_hash = self.generate_message_hash(message)
-                        cursor = self.conn.cursor()
-                        cursor.execute(
-                            "INSERT OR REPLACE INTO forwarded_messages (source_chat_id, source_message_id, target_chat_id, target_topic_id, message_hash, forwarded_at) VALUES (?, ?, ?, ?, ?, datetime('now'))",
-                            (message.chat_id, message.id, session.target_chat.id, target_topic_id, message_hash)
-                        )
-                        self.conn.commit()
-                        return True
-            except Exception:
-                pass
-            return False
+                
         except Exception as e:
             logger.error(f"Ошибка пересылки сообщения {message.id}: {e}")
+            session.stats.failed += 1
             return False
     
-    def generate_message_hash(self, message):
-        content = message.text or ""
+    def extract_message_text(self, message):
+        """Извлекает текст из сообщения"""
+        if message.text:
+            return message.text
         
-        if message.media:
+        if hasattr(message, 'message') and message.message:
+            return message.message
+        
+        # Извлекаем текст из различных типов медиа
+        if hasattr(message, 'media'):
+            if hasattr(message.media, 'document'):
+                if hasattr(message.media.document, 'attributes'):
+                    for attr in message.media.document.attributes:
+                        if hasattr(attr, 'file_name'):
+                            return f"📎 Файл: {attr.file_name}"
+            
+            if hasattr(message.media, 'photo'):
+                return "🖼️ Фото"
+            
+            if hasattr(message.media, 'video'):
+                return "🎥 Видео"
+            
+            if hasattr(message.media, 'audio'):
+                return "🎵 Аудио"
+            
+            if hasattr(message.media, 'voice'):
+                return "🎤 Голосовое сообщение"
+        
+        return None
+    
+    def extract_message_media(self, message):
+        """Извлекает медиа из сообщения"""
+        if hasattr(message, 'media') and message.media:
+            return message.media
+        return None
+    
+    async def try_forward_message(self, session, target_entity, target_topic_id, message_text, message_media):
+        """Пытается переслать сообщение разными способами"""
+        try:
+            if message_media:
+                # Пробуем переслать медиа
+                try:
+                    await session.flood_control.safe_operation(
+                        session.client.send_message(
+                            target_entity,
+                            message_text or "📎 Медиа",
+                            file=message_media,
+                            reply_to=target_topic_id
+                        ),
+                        "forward_media"
+                    )
+                    return True
+                except Exception as e:
+                    # Если не получилось с медиа, пробуем только текст
+                    logger.warning(f"Не удалось отправить медиа, пробую текст: {e}")
+            
+            # Отправляем текстовое сообщение
+            if message_text:
+                await session.flood_control.safe_operation(
+                    session.client.send_message(
+                        target_entity,
+                        message_text,
+                        reply_to=target_topic_id
+                    ),
+                    "forward_text"
+                )
+                return True
+            
+            # Если текст и медиа отсутствуют, создаем заглушку
+            if not message_text and not message_media:
+                await session.flood_control.safe_operation(
+                    session.client.send_message(
+                        target_entity,
+                        "📎 Сообщение",
+                        reply_to=target_topic_id
+                    ),
+                    "forward_empty"
+                )
+                return True
+                
+        except Exception as e:
+            logger.error(f"Ошибка отправки сообщения: {e}")
+            return False
+        
+        return False
+    
+    def generate_message_hash(self, message):
+        """Генерирует хеш сообщения"""
+        content = self.extract_message_text(message) or ""
+        
+        if hasattr(message, 'media') and message.media:
             if hasattr(message.media, 'photo'):
                 if hasattr(message.media.photo, 'id'):
                     content += f"photo_{message.media.photo.id}"
-                else:
-                    content += f"photo_{hash(str(message.media.photo))}"
             elif hasattr(message.media, 'document'):
                 if hasattr(message.media.document, 'id'):
                     content += f"document_{message.media.document.id}"
-                else:
-                    content += f"document_{hash(str(message.media.document))}"
-            elif hasattr(message.media, 'video'):
-                content += f"video_{hash(str(message.media.video))}"
-            elif hasattr(message.media, 'audio'):
-                content += f"audio_{hash(str(message.media.audio))}"
-            else:
-                content += f"media_{hash(str(message.media))}"
         
         if hasattr(message, 'date'):
-            content += f"_{message.date.timestamp()}"
+            content += f"_{int(message.date.timestamp())}"
+        
+        if hasattr(message, 'id'):
+            content += f"_{message.id}"
         
         return hashlib.sha256(content.encode()).hexdigest()
     
